@@ -7,6 +7,8 @@ No network, no backend; receipts never leave the phone.
 - Swift-native **Vision** OCR (`RecognizeTextRequest`, iOS 18+)
 - Pluggable pipeline: swap the OCR engine or the extractor (e.g. an on-device LLM) via protocols
 - Optional **UIKit** capture screen (`ReceiptKitUI`) built on the system document camera
+- Optional **on-device LLM extraction** (`ReceiptKitIntelligence`): Apple Foundation Models with guided generation, falling back to heuristics
+- **Measured, not claimed**: an evaluation harness compares extractors on labeled real receipts ([results](#evaluation))
 - Unit tested with **Swift Testing**
 
 ## Installation
@@ -17,7 +19,12 @@ Swift Package Manager:
 .package(url: "https://github.com/neomond/ReceiptKit", from: "0.1.0")
 ```
 
-Add `ReceiptKit` (core) and, if you want the ready-made screen, `ReceiptKitUI`.
+| Product | Use it for | Minimum OS |
+|---|---|---|
+| `ReceiptKit` | Core: OCR, heuristic extraction, validation | iOS 18 |
+| `ReceiptKitUI` | Ready-made UIKit capture screen | iOS 18 |
+| `ReceiptKitIntelligence` | On-device LLM extractor with fallback | iOS 18 (LLM used on iOS 26+) |
+| `ReceiptKitEvaluation` | Fixture format and scoring, for building your own eval set | iOS 18 / macOS 15 |
 
 ## Usage
 
@@ -65,15 +72,33 @@ final class ExpensesViewController: UIViewController, ReceiptCaptureViewControll
 
 Add `NSCameraUsageDescription` to the host app's Info.plist.
 
+### Example app
+
+`Example/ReceiptKitDemo` is a minimal UIKit app: scan a receipt, see the parsed result next to the raw OCR, and export the scan as an evaluation fixture. Open `Example/ReceiptKitDemo/ReceiptKitDemo.xcodeproj` and run it on an iPhone (the simulator has no document camera).
+
 ### Customizing
 
 ```swift
 let scanner = ReceiptScanner(
     configuration: ReceiptKitConfiguration(defaultCurrencyCode: "GBP"),
-    recognizer: MyOCREngine(),              // any TextRecognizing
-    extractor: FoundationModelsExtractor()  // any ReceiptExtracting
+    recognizer: MyOCREngine(),   // any TextRecognizing
+    extractor: MyExtractor()     // any ReceiptExtracting
 )
 ```
+
+### On-device LLM extraction
+
+```swift
+import ReceiptKitIntelligence
+
+// Foundation Models + heuristic fallback where Apple Intelligence is available,
+// heuristic alone everywhere else. No availability checks needed in the host.
+let scanner = ReceiptScanner(extractor: ReceiptExtractors.bestAvailable())
+```
+
+The LLM never sees the image. It gets the OCR text in reading order and fills a typed `@Generable` struct, so its output can't be malformed, and decoding is greedy so the same receipt always gives the same answer. Anything that goes wrong (model unavailable, receipt too long for the context window) falls back to the heuristic extractor.
+
+**Amount grounding.** Every total and item amount the model returns must appear on the receipt as a money-looking number (with decimals), or it is discarded. On the very first labeled receipt, the model returned the shop's tax ID (`VÖEN: 1600252451`) as the total, and its items still summed to that total, so the consistency check alone could not catch it. A missing total makes the scan ask the user to review it; a wrong one would be saved silently.
 
 ## Architecture
 
@@ -82,11 +107,13 @@ ReceiptScanner (public facade)
   │
   ├─ TextRecognizing ──────── VisionTextRecognizer      image → [RecognizedLine]
   │
-  ├─ ReceiptExtracting ────── HeuristicReceiptExtractor [RecognizedLine] → Receipt
-  │                              ├─ RowGrouper           merge OCR fragments into printed rows
-  │                              ├─ AmountParser         money amounts, locale-agnostic separators
-  │                              ├─ DateParser           day-first + ISO dates
-  │                              └─ ReceiptParser        merchant / items / total / currency
+  ├─ ReceiptExtracting ────── FallbackReceiptExtractor
+  │                              ├─ FoundationModelsReceiptExtractor  on-device LLM (ReceiptKitIntelligence, iOS 26+)
+  │                              └─ HeuristicReceiptExtractor         rule-based fallback
+  │                                    ├─ RowGrouper      merge OCR fragments into printed rows
+  │                                    ├─ AmountParser    money amounts, locale-agnostic separators
+  │                                    ├─ DateParser      day-first + ISO dates
+  │                                    └─ ReceiptParser   merchant / items / total / currency
   │
   └─ ReceiptValidator ─────── [ReceiptWarning]          items vs total, missing fields, OCR confidence
 ```
@@ -106,20 +133,33 @@ Design decisions:
 
 - Single page only (first page of the document scan).
 - Day-first dates; US `MM/dd` receipts will be misread.
-- Heuristic extraction struggles with multi-column layouts and items spanning two lines. This is what the Foundation Models extractor (roadmap) is for.
+- Heuristic extraction struggles with multi-column layouts and items spanning two lines. The Foundation Models extractor targets these; the evaluation measures whether it actually helps.
+- The on-device model has a limited context window; very long receipts fall back to heuristics.
+
+## Evaluation
+
+Extractors are compared on labeled real receipts (OCR output + hand-checked answer), field by field:
+
+```bash
+swift run receiptkit-eval Eval/fixtures --verbose
+```
+
+**Results: pending.** The labeled dataset is being collected. See [Eval/README.md](Eval/README.md) for the fixture format, labeling rules and metrics.
 
 ## Roadmap
 
-- [ ] `FoundationModelsExtractor`: `@Generable` receipt schema, falls back to heuristics when the model is unavailable
-- [ ] Evaluation set (~100 labeled receipts) + script reporting field accuracy per extractor
+- [x] `FoundationModelsReceiptExtractor`: `@Generable` receipt schema, heuristic fallback
+- [x] Evaluation harness: fixture format, scoring, CLI, export from the example app
+- [ ] Labeled dataset (50+ real receipts) and published results
+- [ ] Hybrid extractor: choose between heuristic and LLM output using the items-sum-to-total check
 - [ ] XCFramework distribution (wrapper framework target, `BUILD_LIBRARY_FOR_DISTRIBUTION=YES`)
 - [ ] Multi-page receipts
 
 ---
 
-## Part of: InsightFinance (host app)
+## Planned: InsightFinance (host app)
 
-ReceiptKit is the first module of a larger personal-finance app:
+ReceiptKit is the first module of a personal-finance app that is not built yet. Planned structure:
 
 ```
 InsightFinance/
